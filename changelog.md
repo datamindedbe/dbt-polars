@@ -2,10 +2,16 @@
 
 ## Unreleased
 
+## v0.6.0
+
 ### Implements
 
 - Model contracts on SQL and Python models, with enforced not_null and check constraints.
 - The microbatch incremental strategy on SQL and Python models, for Delta and Iceberg tables.
+
+### Fixes
+
+- Limit dbt-core version to <2
 
 ## v0.5.2
 
