@@ -1,4 +1,6 @@
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from dbt_common.exceptions import DbtRuntimeError
 
@@ -92,6 +94,45 @@ def polars_type_name(dtype: pl.DataType) -> str:
     """Polars repr of `dtype` with double quotes, so it can sit inside a SQL string
     literal and still evaluates to `dtype` in Python."""
     return str(dtype).replace("'", '"')
+
+
+def naive_utc(moment: datetime) -> datetime:
+    """The UTC wall time of `moment`."""
+    if moment.tzinfo is None:
+        return moment
+    return moment.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def first_day_from(moment: datetime) -> date:
+    """The first date whose midnight is at or after `moment`."""
+    day = moment.date()
+    if moment == datetime.combine(day, time()):
+        return day
+    return day + timedelta(days=1)
+
+
+def in_time_range(
+    column: str, dtype: pl.DataType, start: datetime, end: datetime
+) -> pl.Expr:
+    """Whether a date or timestamp `column` lies in `[start, end)`, two UTC wall
+    times. The column is not cast, so Polars can push the filter into a scan."""
+    if dtype == pl.Date:
+        low: Any = first_day_from(start)
+        high: Any = first_day_from(end)
+    elif isinstance(dtype, pl.Datetime) and dtype.time_zone is None:
+        low, high = start, end
+    elif isinstance(dtype, pl.Datetime):
+        low, high = (
+            pl.lit(moment.replace(tzinfo=timezone.utc)).dt.convert_time_zone(
+                dtype.time_zone or "UTC"
+            )
+            for moment in (start, end)
+        )
+    else:
+        raise DbtRuntimeError(
+            f"Column '{column}' has type {dtype}, but must be a date or timestamp."
+        )
+    return (pl.col(column) >= low) & (pl.col(column) < high)
 
 
 def resolve_dtype_names(read_options: dict) -> dict:

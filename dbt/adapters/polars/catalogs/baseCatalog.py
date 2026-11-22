@@ -1,6 +1,7 @@
 import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from datetime import datetime
 
 from dbt_common.exceptions import DbtRuntimeError
 
@@ -144,6 +145,23 @@ class BaseCatalog(ABC):
         incremental_predicates: list[str] | None = None,
         model_config: dict | None = None,
     ) -> None: ...
+
+    def replace_window_relation(
+        self,
+        relation: PolarsRelation,
+        data: pl.DataFrame | pl.LazyFrame,
+        event_time: str,
+        start: datetime,
+        end: datetime,
+        allow_schema_evolution: bool = False,
+        model_config: dict | None = None,
+    ) -> None:
+        """Atomically replaces the rows whose `event_time` lies in `[start, end)`, two
+        UTC wall times, with `data`. Used by the microbatch strategy."""
+        raise DbtRuntimeError(
+            f"The microbatch strategy is not supported by the {self.config.type} "
+            "catalog."
+        )
 
     @abstractmethod
     def set_relation_comment(self, relation: PolarsRelation, comment: str) -> None: ...

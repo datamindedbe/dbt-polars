@@ -5,6 +5,7 @@
 ### Implements
 
 - Model contracts on SQL and Python models, with enforced not_null and check constraints.
+- The microbatch incremental strategy on SQL and Python models, for Delta and Iceberg tables.
 
 ## v0.5.2
 

@@ -22,6 +22,7 @@ def test_source_without_external():
     assert source_file_config(_source({"file_format": "csv"})) == {
         "file_format": "csv",
         "read_options": {},
+        "event_time": None,
         "external": {},
     }
 

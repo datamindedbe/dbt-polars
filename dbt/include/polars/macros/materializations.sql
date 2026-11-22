@@ -18,6 +18,7 @@
   {% do adapter.polars_raise_on_unknown_model_config(target_relation, model) %}
 
   {% if language == 'python' %}
+    {% do model.update({'polars_incremental_write': existing_relation is not none and not full_refresh_mode}) %}
     {% call statement('main', language='python') -%}
       {{ compiled_code }}
     {%- endcall %}
