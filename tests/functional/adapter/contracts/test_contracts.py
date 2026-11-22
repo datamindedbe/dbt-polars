@@ -32,7 +32,7 @@ class PolarsColumnTypes:
             ["1", "integer", "Int32"],
             ["'1'", "text", "String"],
             ["true", "boolean", "Boolean"],
-            ["cast('2013-11-03 00:00:00' as timestamp)", "timestamp", "Datetime"],
+            ["timestamp '2013-11-03 00:00:00'", "timestamp", "Datetime"],
             ["cast(1.5 as double)", "double", "Float64"],
             ["cast('2013-11-03' as date)", "date", "Date"],
             ["cast(1.5 as decimal(10,2))", "decimal(10,2)", "Decimal"],
@@ -117,6 +117,7 @@ models:
 """
 
 
+@pytest.mark.skip_profiles("iceberg")
 class TestFileFormatRejectsEnforcedConstraints(PolarsTestMixin):
     @pytest.fixture(scope="class")
     def models(self):
@@ -134,6 +135,7 @@ class TestFileFormatRejectsEnforcedConstraints(PolarsTestMixin):
         assert "only enforces on Delta and Iceberg" in results[0].message
 
 
+@pytest.mark.skip_profiles("iceberg")
 class TestFileFormatContractWithoutConstraints(PolarsTestMixin):
     @pytest.fixture(scope="class")
     def models(self):
