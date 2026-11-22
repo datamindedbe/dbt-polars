@@ -14,7 +14,7 @@
   {{ run_hooks(pre_hooks, inside_transaction=False) }}
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
   {% do apply_grants(target_relation, config.get('grants'), should_revoke=False) %}
-  {{ polars_raise_if_contract_enforced() }}
+  {{ polars_warn_unenforced_constraints() }}
   {% do adapter.polars_raise_on_unknown_model_config(target_relation, model) %}
 
   {% if language == 'python' %}
@@ -23,7 +23,7 @@
     {%- endcall %}
   {% else %}
     {% if existing_relation is none or full_refresh_mode %}
-      {%- do adapter.polars_execute_model(target_relation, sql, model['extra_ctes'], partition_by, model.get('config', {})) -%}
+      {%- do adapter.polars_execute_model(target_relation, sql, model['extra_ctes'], partition_by, model.get('config', {}), model) -%}
     {% else %}
       {%- set unique_key = config.get('unique_key') -%}
       {%- set strategy = config.get('incremental_strategy') or (unique_key and 'merge') or 'append' -%}
@@ -31,7 +31,7 @@
       {%- set merge_update_columns = config.get('merge_update_columns') -%}
       {%- set merge_exclude_columns = config.get('merge_exclude_columns') -%}
       {%- set incremental_predicates = config.get('predicates') or config.get('incremental_predicates') -%}
-      {%- do adapter.polars_execute_incremental_model(target_relation, sql, unique_key, strategy, on_schema_change, merge_update_columns, merge_exclude_columns, incremental_predicates, model['extra_ctes'], partition_by, model.get('config', {})) -%}
+      {%- do adapter.polars_execute_incremental_model(target_relation, sql, unique_key, strategy, on_schema_change, merge_update_columns, merge_exclude_columns, incremental_predicates, model['extra_ctes'], partition_by, model.get('config', {}), model) -%}
     {% endif %}
     {% call noop_statement('main', 'OK') -%}
       {{ sql }}
@@ -56,7 +56,7 @@
   {{ run_hooks(pre_hooks, inside_transaction=False) }}
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
   {% do apply_grants(target_relation, config.get('grants'), should_revoke=False) %}
-  {{ polars_raise_if_contract_enforced() }}
+  {{ polars_warn_unenforced_constraints() }}
   {% do adapter.polars_raise_on_unknown_model_config(target_relation, model) %}
 
   {% if language == 'python' %}
@@ -64,7 +64,7 @@
       {{ compiled_code }}
     {%- endcall %}
   {% else %}
-    {%- do adapter.polars_execute_model(target_relation, sql, model['extra_ctes'], partition_by, model.get('config', {})) -%}
+    {%- do adapter.polars_execute_model(target_relation, sql, model['extra_ctes'], partition_by, model.get('config', {}), model) -%}
     {% call noop_statement('main', 'OK') -%}
       {{ sql }}
     {%- endcall %}

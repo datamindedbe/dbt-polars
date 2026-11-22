@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Implements
+
+- Model contracts on SQL and Python models, with enforced not_null and check constraints.
+
 ## v0.5.2
 
 ### Implements
