@@ -30,15 +30,32 @@ Overview of features dbt-polars already supports and plans to support in the fut
 | dbt clone | ❌️ | |
 | Hooks | ❌️ | |
 | Grants | ❌️ | |
-| Model contracts | 🚧 | |
+| Model contracts | ✅ | |
 
 ## dbt core extensions
 
-dbt-polars adds three features that are not supported in dbt-core:
+dbt-polars adds four features that are not supported in dbt-core:
 
 - Ephemeral Python models
 - Python data tests
 - Unit tests on Python models
+- Model contracts on Python models
+
+## Constraints
+
+Support for the [constraints](https://docs.getdbt.com/reference/resource-properties/constraints) of a model contract:
+
+| Constraint type | Definable | Enforced |
+|---|---|---|
+| not_null | ✅ | ✅ |
+| primary_key | ✅ | ❌️ |
+| foreign_key | ✅ | ❌️ |
+| unique | ✅ | ❌️ |
+| check | ✅ | ✅ |
+
+A violation of an enforced constraint stops the write, and the previous version of the table stays in place. Incremental models only check the new rows.
+
+Enforced constraints need a Delta or Iceberg table. A model with file_format parquet, csv or ndjson can have a contract, but no not_null or check constraints.
 
 ## Macros
 

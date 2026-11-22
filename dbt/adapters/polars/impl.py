@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 import sqlparse
-from dbt.adapters.base.impl import BaseAdapter
+from dbt.adapters.base.impl import BaseAdapter, ConstraintSupport
 from dbt.adapters.base.meta import available
 from dbt.adapters.base.relation import BaseRelation
 from dbt.adapters.contracts.connection import AdapterResponse
@@ -24,6 +24,7 @@ from dbt_common.clients.agate_helper import (
     Number,
     table_from_data,
 )
+from dbt_common.contracts.constraints import ConstraintType
 from dbt_common.exceptions import CompilationError, DbtRuntimeError
 
 import polars as pl
@@ -32,6 +33,7 @@ from dbt.adapters.polars.column import PolarsColumn
 from dbt.adapters.polars.compute_slots import compute_slots, holds_compute_slot
 from dbt.adapters.polars.connections import PolarsConnectionManager, PolarsCredentials
 from dbt.adapters.polars.fixtures import fixture_frame
+from dbt.adapters.polars.model_contract import ModelContract
 from dbt.adapters.polars.relation import PolarsRelation
 from dbt.adapters.polars.sql_rewrite import parse_and_rewrite
 from dbt.adapters.polars.utils import polars_type_name, resolve_polars_type
@@ -149,6 +151,16 @@ class PolarsAdapter(BaseAdapter):
     ConnectionManager = PolarsConnectionManager
     Relation = PolarsRelation
     Column = PolarsColumn
+
+    # not_null and check are tested row by row during the write. The others need
+    # all keys or another table in memory.
+    CONSTRAINT_SUPPORT = {
+        ConstraintType.check: ConstraintSupport.ENFORCED,
+        ConstraintType.not_null: ConstraintSupport.ENFORCED,
+        ConstraintType.unique: ConstraintSupport.NOT_ENFORCED,
+        ConstraintType.primary_key: ConstraintSupport.NOT_ENFORCED,
+        ConstraintType.foreign_key: ConstraintSupport.NOT_ENFORCED,
+    }
 
     def __init__(self, config, mp_context):
         super().__init__(config, mp_context)
@@ -1019,26 +1031,31 @@ class PolarsAdapter(BaseAdapter):
         extra_ctes: list | None = None,
         partition_by: str | list[str] | None = None,
         model_config: dict | None = None,
+        model: dict | None = None,
     ) -> None:
         model_config = model_config or {}
+        contract = ModelContract(model or {})
         ctes = extra_ctes or []
         cte_frames = self._evaluate_ctes(ctes)
         sql = self._strip_all_ctes(sql, ctes)
-        new_data = self._run_sql(sql, eager=False, extra_frames=cte_frames or None)
-        catalog = self.get_storage_catalog(relation.catalog)
-        self._incremental_write(
-            catalog,
-            relation,
-            new_data,
-            unique_key,
-            strategy,
-            on_schema_change,
-            merge_update_columns,
-            merge_exclude_columns,
-            incremental_predicates,
-            partition_by,
-            model_config,
+        new_data = contract.apply(
+            self._run_sql(sql, eager=False, extra_frames=cte_frames or None)
         )
+        catalog = self.get_storage_catalog(relation.catalog)
+        with contract.violations_reported():
+            self._incremental_write(
+                catalog,
+                relation,
+                new_data,
+                unique_key,
+                strategy,
+                on_schema_change,
+                merge_update_columns,
+                merge_exclude_columns,
+                incremental_predicates,
+                partition_by,
+                model_config,
+            )
 
     @available
     @holds_compute_slot
@@ -1049,16 +1066,21 @@ class PolarsAdapter(BaseAdapter):
         extra_ctes: list | None = None,
         partition_by: str | list[str] | None = None,
         model_config: dict | None = None,
+        model: dict | None = None,
     ) -> None:
         model_config = model_config or {}
+        contract = ModelContract(model or {})
         ctes = extra_ctes or []
         cte_frames = self._evaluate_ctes(ctes)
         sql = self._strip_all_ctes(sql, ctes)
-        result = self._run_sql(sql, eager=False, extra_frames=cte_frames or None)
-        catalog = self.get_storage_catalog(relation.catalog)
-        catalog.write_relation(
-            relation, result, _normalize_partition_by(partition_by), model_config
+        result = contract.apply(
+            self._run_sql(sql, eager=False, extra_frames=cte_frames or None)
         )
+        catalog = self.get_storage_catalog(relation.catalog)
+        with contract.violations_reported():
+            catalog.write_relation(
+                relation, result, _normalize_partition_by(partition_by), model_config
+            )
 
     @holds_compute_slot
     def submit_python_job(
@@ -1068,7 +1090,10 @@ class PolarsAdapter(BaseAdapter):
         cte_frames = self._evaluate_ctes(extra_ctes)
         python_code = self._strip_all_ctes(compiled_code, extra_ctes)
 
-        lazy_result = self._run_python_model(python_code, cte_frames or None)
+        contract = ModelContract(parsed_model)
+        lazy_result = contract.apply(
+            self._run_python_model(python_code, cte_frames or None)
+        )
 
         model_config = parsed_model.get("config", {})
         target_relation = PolarsRelation.create(
@@ -1101,24 +1126,26 @@ class PolarsAdapter(BaseAdapter):
                 or "append"
             )
             on_schema_change = model_config.get("on_schema_change") or "ignore"
-            self._incremental_write(
-                catalog,
-                target_relation,
-                lazy_result,
-                unique_key,
-                strategy,
-                on_schema_change,
-                merge_update_columns=model_config.get("merge_update_columns"),
-                merge_exclude_columns=model_config.get("merge_exclude_columns"),
-                incremental_predicates=model_config.get("predicates")
-                or model_config.get("incremental_predicates"),
-                partition_by=partition_by,
-                model_config=model_config,
-            )
+            with contract.violations_reported():
+                self._incremental_write(
+                    catalog,
+                    target_relation,
+                    lazy_result,
+                    unique_key,
+                    strategy,
+                    on_schema_change,
+                    merge_update_columns=model_config.get("merge_update_columns"),
+                    merge_exclude_columns=model_config.get("merge_exclude_columns"),
+                    incremental_predicates=model_config.get("predicates")
+                    or model_config.get("incremental_predicates"),
+                    partition_by=partition_by,
+                    model_config=model_config,
+                )
         else:
-            catalog.write_relation(
-                target_relation, lazy_result, partition_by, model_config
-            )
+            with contract.violations_reported():
+                catalog.write_relation(
+                    target_relation, lazy_result, partition_by, model_config
+                )
 
         return AdapterResponse(_message="OK")
 

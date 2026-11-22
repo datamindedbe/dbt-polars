@@ -138,6 +138,44 @@ except (ImportError, AttributeError):
         "Unit tests on Python models are not supported with this version of dbt-core."
     )
 
+# dbt-core monkeypatch to support contracts on Python models:
+#
+# ModelPatchParser._validate_constraint_prerequisites rejects an enforced contract on
+# any non-SQL model. dbt-polars enforces it on the frame a Python model returns, so
+# the validation runs unmodified with the node presented as SQL.
+try:
+    from dbt.node_types import ModelLanguage
+    from dbt.parser.schemas import ModelPatchParser
+
+    original_validate_constraint_prerequisites = (
+        ModelPatchParser._validate_constraint_prerequisites
+    )
+
+    def validate_constraint_prerequisites_for_python_models(
+        self, model_node, *args, **kwargs
+    ):
+        if model_node.language != ModelLanguage.python:
+            return original_validate_constraint_prerequisites(
+                self, model_node, *args, **kwargs
+            )
+        model_node.language = ModelLanguage.sql
+        try:
+            return original_validate_constraint_prerequisites(
+                self, model_node, *args, **kwargs
+            )
+        finally:
+            model_node.language = ModelLanguage.python
+
+    ModelPatchParser._validate_constraint_prerequisites = (  # type: ignore[method-assign]
+        validate_constraint_prerequisites_for_python_models
+    )
+except (ImportError, AttributeError):
+    from dbt.adapters.events.logging import AdapterLogger
+
+    AdapterLogger("polars").warning(
+        "Contracts on Python models are not supported with this version of dbt-core."
+    )
+
 Plugin = AdapterPlugin(
     adapter=PolarsAdapter,  # type: ignore[arg-type]
     credentials=PolarsCredentials,
