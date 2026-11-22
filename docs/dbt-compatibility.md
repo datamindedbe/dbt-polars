@@ -6,15 +6,14 @@ Overview of features dbt-polars already supports and plans to support in the fut
 |---|---|
 | ✅ | Supported |
 | 🟡 | Partially supported |
-| 🚧 | Not supported yet, but planned |
-| ❌️ | Not supported, unplanned |
+| ❌️ | Unsupported |
 
 ## dbt core features
 
 | Feature | Status | Remarks |
 |---|---|---|
 | table materialization | ✅ | |
-| incremental materialization | 🟡 | ✅ append <br> ✅ merge <br> ✅ delete+insert<br/> 🚧 microbatch |
+| incremental materialization | ✅ | ✅ append <br> ✅ merge <br> ✅ delete+insert<br/> ✅ microbatch |
 | ephemeral materialization | ✅ | |
 | view materialization | ❌️ | dbt-polars has no database to hold views. Use table or ephemeral instead. |
 | Snapshots | ✅ | |
@@ -34,12 +33,13 @@ Overview of features dbt-polars already supports and plans to support in the fut
 
 ## dbt core extensions
 
-dbt-polars adds four features that are not supported in dbt-core:
+dbt-polars adds five features that are not supported in dbt-core:
 
 - Ephemeral Python models
 - Python data tests
 - Unit tests on Python models
 - Model contracts on Python models
+- Microbatch on Python models
 
 ## Constraints
 
@@ -56,6 +56,12 @@ Support for the [constraints](https://docs.getdbt.com/reference/resource-propert
 A violation of an enforced constraint stops the write, and the previous version of the table stays in place. Incremental models only check the new rows.
 
 Enforced constraints need a Delta or Iceberg table. A model with file_format parquet, csv or ndjson can have a contract, but no not_null or check constraints.
+
+## Microbatch
+
+Each batch of a [microbatch](https://docs.getdbt.com/docs/build/incremental-microbatch) model replaces the rows of its event_time window in a single commit. A batch fails when its result has a row with an event_time outside the window, and the table stays unchanged. To drop such rows instead, filter them in the model.
+
+Microbatch needs a Delta or Iceberg table, and doesn't support unique_key or incremental_predicates.
 
 ## Macros
 

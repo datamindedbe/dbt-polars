@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
+from dbt.adapters.polars.utils import first_day_from, in_time_range
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -149,18 +151,20 @@ def key_prune_filter(keys: list[str], key_rows: pl.DataFrame):
     return filters[0] if len(filters) == 1 else And(*filters)
 
 
-def delete_rows_by_keys(
+def delete_rows_where(
     tbl: Table,
     transaction: Transaction,
     snapshot_writer: _SnapshotProducer[Any],
     io: FileIO,
-    keys: list[str],
-    key_rows: pl.DataFrame,
+    prune_filter: Any,
+    columns: list[str],
+    is_deleted: Callable[[pl.DataFrame], pl.Series],
     counter: itertools.count,
 ) -> pl.DataFrame:
-    """Copy-on-write delete of the rows whose `keys` match a row of `key_rows`,
-    staged on `snapshot_writer`. Matching is a Polars join, so a NULL key never
-    matches. Returns the deleted rows."""
+    """Copy-on-write delete staged on `snapshot_writer`. For every data file that
+    `prune_filter` keeps, `is_deleted` gets the file's `columns` and marks the rows
+    to delete; a file with such rows is rewritten without them. Returns the deleted
+    rows."""
     from pyiceberg.expressions import AlwaysTrue
     from pyiceberg.io.pyarrow import (
         ArrowScan,
@@ -180,18 +184,14 @@ def delete_rows_by_keys(
             ).to_table(tasks=[task])
         )
 
-    probe = key_rows.select(keys).unique()
     deleted_rows = [pl.DataFrame(schema_to_pyarrow(schema).empty_table())]
-    for task in tbl.scan(row_filter=key_prune_filter(keys, probe)).plan_files():
-        file_keys = read_file(task, schema.select(*keys))
-        file_probe = probe.cast({key: file_keys.schema[key] for key in keys}).join(
-            file_keys, on=keys, how="semi"
-        )
-        if file_probe.is_empty():
+    for task in tbl.scan(row_filter=prune_filter).plan_files():
+        deleted = is_deleted(read_file(task, schema.select(*columns)))
+        if not deleted.any():
             continue
         all_rows = read_file(task, schema)
-        kept_rows = all_rows.join(file_probe, on=keys, how="anti")
-        deleted_rows.append(all_rows.join(file_probe, on=keys, how="semi"))
+        kept_rows = all_rows.filter(~deleted)
+        deleted_rows.append(all_rows.filter(deleted))
         snapshot_writer.delete_data_file(task.file)
         if not kept_rows.is_empty():
             for data_file in _dataframe_to_data_files(
@@ -203,6 +203,100 @@ def delete_rows_by_keys(
             ):
                 snapshot_writer.append_data_file(data_file)
     return pl.concat(deleted_rows)
+
+
+def delete_rows_by_keys(
+    tbl: Table,
+    transaction: Transaction,
+    snapshot_writer: _SnapshotProducer[Any],
+    io: FileIO,
+    keys: list[str],
+    key_rows: pl.DataFrame,
+    counter: itertools.count,
+) -> pl.DataFrame:
+    """Copy-on-write delete of the rows whose `keys` match a row of `key_rows`,
+    staged on `snapshot_writer`. Matching is a Polars join, so a NULL key never
+    matches. Returns the deleted rows."""
+    probe = key_rows.select(keys).unique()
+
+    def is_deleted(file_keys: pl.DataFrame) -> pl.Series:
+        matched = (
+            file_keys.with_row_index("dbt_polars_row")
+            .join(
+                probe.cast({key: file_keys.schema[key] for key in keys}),
+                on=keys,
+                how="semi",
+            )
+            .get_column("dbt_polars_row")
+        )
+        return pl.int_range(file_keys.height, eager=True).is_in(matched)
+
+    return delete_rows_where(
+        tbl,
+        transaction,
+        snapshot_writer,
+        io,
+        key_prune_filter(keys, probe),
+        keys,
+        is_deleted,
+        counter,
+    )
+
+
+def window_prune_filter(field_type: Any, event_time: str, start, end):
+    """File-pruning predicate for `[start, end)` on a date or timestamp field; a
+    superset of the rows in the window."""
+    from pyiceberg.expressions import AlwaysTrue, And, GreaterThanOrEqual, LessThan
+    from pyiceberg.types import DateType, TimestampType, TimestamptzType
+
+    if isinstance(field_type, DateType):
+        low, high = (first_day_from(moment).isoformat() for moment in (start, end))
+    elif isinstance(field_type, TimestampType):
+        low, high = start.isoformat(), end.isoformat()
+    elif isinstance(field_type, TimestamptzType):
+        low, high = (
+            moment.replace(tzinfo=timezone.utc).isoformat() for moment in (start, end)
+        )
+    else:
+        return AlwaysTrue()
+    return And(GreaterThanOrEqual(event_time, low), LessThan(event_time, high))
+
+
+def overwrite_window_and_append(
+    tbl: Table,
+    transaction: Transaction,
+    io: FileIO,
+    event_time: str,
+    start: datetime,
+    end: datetime,
+    data: pl.DataFrame | pl.LazyFrame,
+    model_config: dict,
+) -> None:
+    """Replaces the rows whose `event_time` lies in `[start, end)` with `data`, in
+    a single snapshot like overwrite_keys_and_append."""
+    counter = itertools.count(0)
+    field_type = transaction.table_metadata.schema().find_field(event_time).field_type
+
+    def is_deleted(file_rows: pl.DataFrame) -> pl.Series:
+        dtype = file_rows.schema[event_time]
+        return file_rows.select(
+            in_time_range(event_time, dtype, start, end).fill_null(False)
+        ).to_series()
+
+    with transaction.update_snapshot().overwrite() as snapshot_writer:
+        delete_rows_where(
+            tbl,
+            transaction,
+            snapshot_writer,
+            io,
+            window_prune_filter(field_type, event_time, start, end),
+            [event_time],
+            is_deleted,
+            counter,
+        )
+        _write_data_files(
+            snapshot_writer, transaction, io, data, model_config, counter=counter
+        )
 
 
 def overwrite_keys_and_append(

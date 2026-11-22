@@ -5,6 +5,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, overload
 
 from dbt.adapters.contracts.relation import RelationType
@@ -21,6 +22,7 @@ from dbt.adapters.polars.catalogs.iceberg_write_utils import (
     _write_data_files,
     delete_rows_by_keys,
     overwrite_keys_and_append,
+    overwrite_window_and_append,
 )
 from dbt.adapters.polars.compute_slots import compute_slots, releases_compute_slot
 from dbt.adapters.polars.relation import PolarsRelation
@@ -574,6 +576,38 @@ class IcebergCatalog(BaseCatalog):
                 )
 
         self._commit(self._id(relation), delete_matched)
+        self._invalidate_table_cache(self._id(relation))
+
+    def replace_window_relation(
+        self,
+        relation: PolarsRelation,
+        data: pl.DataFrame | pl.LazyFrame,
+        event_time: str,
+        start: datetime,
+        end: datetime,
+        allow_schema_evolution: bool = False,
+        model_config: dict | None = None,
+    ) -> None:
+        model_config = model_config or {}
+        data = _cast_unsigned_to_signed(data)
+
+        def replace_window(tbl: Table) -> None:
+            with tbl.transaction() as transaction:
+                if allow_schema_evolution:
+                    with transaction.update_schema() as update:
+                        update.union_by_name(data.collect_schema().to_arrow())
+                overwrite_window_and_append(
+                    tbl,
+                    transaction,
+                    tbl.io,
+                    event_time,
+                    start,
+                    end,
+                    data,
+                    model_config,
+                )
+
+        self._commit(self._id(relation), replace_window, data)
         self._invalidate_table_cache(self._id(relation))
 
     def apply_snapshot_delta(

@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import polars as pl
 import pytest
 
@@ -9,6 +11,7 @@ from dbt.adapters.polars.catalogs.iceberg_write_utils import (
     _sync_schema,
     key_prune_filter,
     overwrite_keys_and_append,
+    overwrite_window_and_append,
 )
 
 # ---------------------------------------------------------------------------
@@ -326,6 +329,85 @@ def test_large_composite_key_batch_completes(composite_table):
 
     assert time.perf_counter() - start < 10
     assert remaining_vals(composite_table) == ["1b", "2b", "null_a"]
+
+
+# ---------------------------------------------------------------------------
+# overwrite_window_and_append
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def events_table(tmp_path):
+    """Table with a timestamp event_time, one data file per day plus a NULL one."""
+    pytest.importorskip("pyiceberg")
+    import pyarrow as pa
+    from pyiceberg.catalog import load_catalog
+
+    catalog = load_catalog(
+        "test",
+        **{
+            "type": "sql",
+            "uri": f"sqlite:///{tmp_path}/events.db",
+            "warehouse": f"file://{tmp_path}/warehouse",
+        },
+    )
+    catalog.create_namespace(("ns",))
+    schema = pa.schema(
+        [pa.field("event_time", pa.timestamp("us")), pa.field("val", pa.string())]
+    )
+    tbl = catalog.create_table("ns.events", schema=schema)
+    for event_time, val in [
+        (datetime(2020, 1, 1, 10), "day1"),
+        (datetime(2020, 1, 2, 10), "day2"),
+        (datetime(2020, 1, 3, 10), "day3"),
+        (None, "null"),
+    ]:
+        tbl.append(pa.table({"event_time": [event_time], "val": [val]}, schema=schema))
+    return tbl
+
+
+def replace_day_two(tbl, new_vals: list[str]) -> None:
+    new_rows = pl.DataFrame(
+        {
+            "event_time": [datetime(2020, 1, 2, 12)] * len(new_vals),
+            "val": new_vals,
+        },
+        schema={"event_time": pl.Datetime("us"), "val": pl.String},
+    )
+    with tbl.transaction() as txn:
+        overwrite_window_and_append(
+            tbl,
+            txn,
+            tbl.io,
+            "event_time",
+            datetime(2020, 1, 2),
+            datetime(2020, 1, 3),
+            new_rows,
+            {},
+        )
+
+
+def test_window_rows_are_replaced(events_table):
+    replace_day_two(events_table, ["day2_new"])
+    assert remaining_vals(events_table) == ["day1", "day2_new", "day3", "null"]
+
+
+def test_empty_batch_deletes_the_window(events_table):
+    replace_day_two(events_table, [])
+    assert remaining_vals(events_table) == ["day1", "day3", "null"]
+
+
+def test_window_replace_commits_one_snapshot(events_table):
+    snapshots_before = len(events_table.snapshots())
+    replace_day_two(events_table, ["day2_new"])
+    assert len(events_table.snapshots()) == snapshots_before + 1
+
+
+def test_files_outside_the_window_are_not_rewritten(events_table):
+    files_before = {task.file.file_path for task in events_table.scan().plan_files()}
+    replace_day_two(events_table, ["day2_new"])
+    files_after = {task.file.file_path for task in events_table.scan().plan_files()}
+    assert len(files_before - files_after) == 1
 
 
 # ---------------------------------------------------------------------------

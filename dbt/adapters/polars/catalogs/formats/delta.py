@@ -1,9 +1,11 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 from deltalake import DeltaTable
 
 import polars as pl
 from dbt.adapters.polars.catalogs.baseCatalog import get_write_options
+from dbt.adapters.polars.utils import first_day_from
 
 
 class DeltaFormat:
@@ -80,6 +82,44 @@ class DeltaFormat:
             str(path),
             data,
             "append",
+            model_config,
+            adapter_delta_opts,
+            storage_options=storage_options,
+        )
+
+    @staticmethod
+    def replace_window(
+        path: str | Path,
+        data: pl.DataFrame | pl.LazyFrame,
+        event_time: str,
+        start: datetime,
+        end: datetime,
+        allow_schema_evolution: bool,
+        model_config: dict,
+        storage_options: dict[str, str] | None = None,
+    ) -> None:
+        """Overwrites only the rows whose event_time lies in `[start, end)`, in one
+        commit. Delta rejects a row of `data` outside that range."""
+        dtype = data.collect_schema()[event_time]
+        if dtype == pl.Date:
+            low, high = (first_day_from(moment).isoformat() for moment in (start, end))
+        elif isinstance(dtype, pl.Datetime) and dtype.time_zone is None:
+            low, high = str(start), str(end)
+        else:
+            low, high = (
+                moment.replace(tzinfo=timezone.utc).isoformat()
+                for moment in (start, end)
+            )
+        column = '"' + event_time.replace('"', '""') + '"'
+        adapter_delta_opts: dict = {
+            "predicate": f"{column} >= '{low}' AND {column} < '{high}'"
+        }
+        if allow_schema_evolution:
+            adapter_delta_opts["schema_mode"] = "merge"
+        DeltaFormat._write(
+            str(path),
+            data,
+            "overwrite",
             model_config,
             adapter_delta_opts,
             storage_options=storage_options,

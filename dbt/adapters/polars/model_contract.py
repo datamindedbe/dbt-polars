@@ -1,4 +1,4 @@
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 
 from dbt.adapters.events.logging import AdapterLogger
@@ -24,12 +24,54 @@ def contract_type_matches(declared_type: str, actual_type: pl.DataType) -> bool:
     return True
 
 
+class RowGuard:
+    """Checks rows while a model's result is written.
+
+    A check passes every row on unchanged, but raises from inside the streaming
+    write when a batch has a violating row, so nothing is committed.
+    """
+
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self.violations: list[str] = []
+
+    def check(
+        self, frame: pl.LazyFrame, violation: pl.Expr, description: str
+    ) -> pl.LazyFrame:
+        def raise_on_violation(batch: pl.DataFrame) -> pl.DataFrame:
+            if batch.select(violation.any()).item():
+                self.violations.append(description)
+                raise DbtRuntimeError(
+                    f"Model '{self.model_name}' violates its {description}."
+                )
+            return batch
+
+        # A frame-level map is a plan node of its own. A filter would be merged
+        # with the model's own filters and could see rows they remove.
+        return frame.map_batches(raise_on_violation, streamable=True)
+
+    @contextmanager
+    def violations_reported(self) -> Iterator[None]:
+        """Re-raises a write that failed on a violation with a clear message.
+
+        The guard's error can reach the caller wrapped, for example inside a
+        DeltaError, so the recorded violation is raised instead.
+        """
+        try:
+            yield
+        except Exception as exc:
+            if not self.violations:
+                raise
+            raise DbtRuntimeError(
+                f"Model '{self.model_name}' violates its {self.violations[0]}."
+            ) from exc
+
+
 class ModelContract:
     """Enforces a model's contract on its result frame while it is written.
 
     The column names and types are checked against the schema. not_null and check
-    constraints become filters that keep every row, but raise from inside the
-    streaming write when a batch violates them, so nothing is committed.
+    constraints become row checks on the guard.
     """
 
     def __init__(self, model: dict):
@@ -39,9 +81,8 @@ class ModelContract:
         self.file_format = (model.get("config") or {}).get("file_format")
         self.columns: dict = model.get("columns") or {}
         self.model_constraints: list = model.get("constraints") or []
-        self.violations: list[str] = []
 
-    def apply(self, frame: pl.LazyFrame) -> pl.LazyFrame:
+    def apply(self, frame: pl.LazyFrame, guard: RowGuard) -> pl.LazyFrame:
         if not self.enforced:
             return frame
         self.check_columns(frame.collect_schema())
@@ -56,13 +97,7 @@ class ModelContract:
                 f"file_format='{self.file_format}'."
             )
         for description, violation in row_checks:
-            frame = frame.filter(
-                violation.map_batches(
-                    self.guard(description),
-                    return_dtype=pl.Boolean,
-                    is_elementwise=True,
-                )
-            )
+            frame = guard.check(frame, violation, description)
         return frame
 
     def check_columns(self, schema: pl.Schema) -> None:
@@ -128,30 +163,3 @@ class ModelContract:
                 f"Model '{self.model_name}' has a custom constraint, which dbt-polars "
                 "does not apply."
             )
-
-    def guard(self, description: str) -> Callable[[pl.Series], pl.Series]:
-        def raise_on_violation(violations: pl.Series) -> pl.Series:
-            if violations.any():
-                self.violations.append(description)
-                raise DbtRuntimeError(
-                    f"Model '{self.model_name}' violates its {description}."
-                )
-            return ~violations
-
-        return raise_on_violation
-
-    @contextmanager
-    def violations_reported(self) -> Iterator[None]:
-        """Re-raises a write that failed on a violation with a clear message.
-
-        The guard's error can reach the caller wrapped, for example inside a
-        DeltaError, so the recorded violation is raised instead.
-        """
-        try:
-            yield
-        except Exception as exc:
-            if not self.violations:
-                raise
-            raise DbtRuntimeError(
-                f"Model '{self.model_name}' violates its {self.violations[0]}."
-            ) from exc

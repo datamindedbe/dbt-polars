@@ -199,6 +199,32 @@ class TestModelLevelCheckConstraint(PolarsTestMixin):
         assert "amount_below_id constraint (amount < id)" in results[0].message
 
 
+filtered_nulls_model_sql = """
+select id, amount from (
+    select cast(1 as bigint) as id, cast(5 as double) as amount
+    union all
+    select cast(null as bigint) as id, cast(3 as double) as amount
+) where id is not null
+"""
+
+
+@skip_file_formats
+class TestConstraintChecksRowsAfterModelFilters(PolarsTestMixin):
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "my_model.sql": filtered_nulls_model_sql,
+            "schema.yml": contract_schema_yml("my_model"),
+        }
+
+    def test_rows_removed_by_the_model_are_not_checked(self, project):
+        run_dbt(["run"])
+        rows = polars_read_relation(
+            project.adapter, "my_model", columns=["id", "amount"]
+        )
+        assert rows == [(1, 5.0)]
+
+
 @skip_file_formats
 class TestUnenforcedConstraintWarns(PolarsTestMixin):
     @pytest.fixture(scope="class")

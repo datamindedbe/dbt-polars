@@ -2,6 +2,7 @@ import posixpath
 from abc import abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from enum import Enum
 from typing import NoReturn
 
@@ -55,6 +56,7 @@ class WriteOperation(str, Enum):
     APPEND = "append"
     MERGE = "merge"
     DELETE = "delete"
+    REPLACE_WINDOW = "replace_window"
     SNAPSHOT = "snapshot"
     COMMENT = "comment"
 
@@ -291,6 +293,31 @@ class StorageCatalog(BaseCatalog):
                     storage_options=opts,
                     model_config=model_config,
                 )
+
+    def replace_window_relation(
+        self,
+        relation: PolarsRelation,
+        data: pl.DataFrame | pl.LazyFrame,
+        event_time: str,
+        start: datetime,
+        end: datetime,
+        allow_schema_evolution: bool = False,
+        model_config: dict | None = None,
+    ) -> None:
+        if file_format_of(relation) != "delta":
+            _unsupported_for_format("microbatch", file_format_of(relation))
+        with self.write_operation(relation, WriteOperation.REPLACE_WINDOW):
+            uri = self.get_uri(relation)
+            DeltaFormat.replace_window(
+                uri,
+                data,
+                event_time,
+                start,
+                end,
+                allow_schema_evolution,
+                model_config or {},
+                storage_options=self.get_storage_options(uri),
+            )
 
     def set_comments(
         self,

@@ -5,7 +5,7 @@ import re
 import threading
 from collections.abc import Iterable
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast, overload
 
 import sqlparse
 from dbt.adapters.base.impl import BaseAdapter, ConstraintSupport
@@ -16,7 +16,6 @@ from dbt.adapters.contracts.relation import RelationConfig, RelationType
 from dbt.adapters.events.logging import AdapterLogger
 from dbt.artifacts.resources import ModelConfig
 from dbt.artifacts.resources.v1.snapshot import SnapshotMetaColumnNames
-from dbt.flags import get_flags
 from dbt_common.clients.agate_helper import (
     Integer as DbtInteger,
 )
@@ -33,10 +32,15 @@ from dbt.adapters.polars.column import PolarsColumn
 from dbt.adapters.polars.compute_slots import compute_slots, holds_compute_slot
 from dbt.adapters.polars.connections import PolarsConnectionManager, PolarsCredentials
 from dbt.adapters.polars.fixtures import fixture_frame
-from dbt.adapters.polars.model_contract import ModelContract
+from dbt.adapters.polars.model_contract import ModelContract, RowGuard
 from dbt.adapters.polars.relation import PolarsRelation
 from dbt.adapters.polars.sql_rewrite import parse_and_rewrite
-from dbt.adapters.polars.utils import polars_type_name, resolve_polars_type
+from dbt.adapters.polars.utils import (
+    in_time_range,
+    naive_utc,
+    polars_type_name,
+    resolve_polars_type,
+)
 
 if TYPE_CHECKING:
     import agate
@@ -96,7 +100,8 @@ def _add_scd_id(df: pl.DataFrame, unique_key: str | list[str]) -> pl.DataFrame:
 
 
 def source_file_config(source: dict) -> dict:
-    """The file_format, read_options and external keys of a source node from the graph.
+    """The file_format, read_options, event_time and external keys of a source node
+    from the graph.
 
     Nothing is validated here: a misconfigured source only fails the runs that read
     it, in source_external_location and the catalog's get_uri.
@@ -106,6 +111,7 @@ def source_file_config(source: dict) -> dict:
     return {
         "file_format": cfg.get("file_format"),
         "read_options": cfg.get("read_options") or {},
+        "event_time": cfg.get("event_time"),
         # The graph lists every ExternalTable field, the unset ones as None
         "external": {k: v for k, v in external.items() if v is not None},
     }
@@ -124,6 +130,77 @@ def source_external_location(name: str, external: dict) -> str | None:
             + "set file_format and read_options under config."
         )
     return external.get("location")
+
+
+class BatchWindow(NamedTuple):
+    """The `[start, end)` event_time range, in UTC wall time, that one microbatch
+    batch replaces."""
+
+    event_time: str
+    start: datetime
+    end: datetime
+
+
+def batch_window(model: dict) -> BatchWindow | None:
+    """The window of a model run as a microbatch batch, after rejecting the configs
+    that dbt-polars doesn't support with microbatch."""
+    config = model.get("config") or {}
+    if config.get("incremental_strategy") != "microbatch":
+        return None
+    model_name = model.get("name", "")
+    unsupported = [
+        key
+        for key in ("unique_key", "incremental_predicates", "predicates")
+        if config.get(key)
+    ]
+    if unsupported:
+        raise DbtRuntimeError(
+            f"Model '{model_name}' sets {', '.join(unsupported)}, which the "
+            "microbatch strategy doesn't support. A batch replaces all rows in its "
+            "event_time window."
+        )
+    file_format = config.get("file_format")
+    if file_format not in (None, "delta"):
+        raise DbtRuntimeError(
+            f"Model '{model_name}' uses the microbatch strategy, which dbt-polars "
+            "only supports on Delta and Iceberg tables, not with "
+            f"file_format='{file_format}'."
+        )
+    batch = model.get("batch") or {}
+    start = batch.get("event_time_start")
+    end = batch.get("event_time_end")
+    if not (config.get("event_time") and start and end):
+        raise DbtRuntimeError(
+            f"Model '{model_name}' uses the microbatch strategy, but dbt didn't run it "
+            "in batches. Check that it sets event_time and that the project doesn't "
+            "override the get_incremental_microbatch_sql macro."
+        )
+    if isinstance(start, str):
+        start = datetime.fromisoformat(start)
+    if isinstance(end, str):
+        end = datetime.fromisoformat(end)
+    return BatchWindow(config["event_time"], naive_utc(start), naive_utc(end))
+
+
+def check_batch_window(
+    frame: pl.LazyFrame, window: BatchWindow, guard: RowGuard
+) -> pl.LazyFrame:
+    """Fails the write when a row's event_time, or a NULL one, is outside the window."""
+    schema = frame.collect_schema()
+    if window.event_time not in schema:
+        raise DbtRuntimeError(
+            f"Model '{guard.model_name}' has event_time '{window.event_time}', which "
+            "is not a column of its result."
+        )
+    inside = in_time_range(
+        window.event_time, schema[window.event_time], window.start, window.end
+    )
+    return guard.check(
+        frame,
+        ~inside.fill_null(False),
+        f"batch window [{window.start}, {window.end}) on event_time "
+        f"'{window.event_time}'",
+    )
 
 
 # Model config keys read by dbt-polars that dbt-core's ModelConfig does not define
@@ -201,6 +278,15 @@ class PolarsAdapter(BaseAdapter):
                 (source["database"], source["schema"], source["identifier"])
             ] = source_file_config(source)
 
+    def relation_event_time(
+        self, database: str, schema: str, identifier: str
+    ) -> str | None:
+        node = self._node_configs.get((database, schema, identifier))
+        if node is not None:
+            return getattr(node.config, "event_time", None)
+        source = self._source_configs.get((database, schema, identifier)) or {}
+        return source.get("event_time")
+
     def load_configs_from_manifest(self) -> None:
         """Fills node and source configs from the manifest, for commands that never
         populate the relation cache (run-operation, --no-populate-cache)."""
@@ -258,9 +344,12 @@ class PolarsAdapter(BaseAdapter):
     ) -> None:
         catalog = self.get_storage_catalog(relation.catalog)
         unknown = sorted(
-            set(ModelConfig.from_dict(model["config"])._extra)
+            key
+            for key in set(ModelConfig.from_dict(model["config"])._extra)
             - POLARS_MODEL_CONFIG_KEYS
             - catalog.model_config_keys
+            # dbt-core sets these itself, e.g. the bounds of a microbatch batch
+            if not key.startswith("__dbt_internal")
         )
         if unknown:
             raise CompilationError(
@@ -700,6 +789,7 @@ class PolarsAdapter(BaseAdapter):
         python_code: str,
         cte_frames: dict[str, pl.LazyFrame] | None = ...,
         allow_bool: Literal[False] = ...,
+        window: BatchWindow | None = ...,
     ) -> pl.LazyFrame: ...
 
     @overload
@@ -708,6 +798,7 @@ class PolarsAdapter(BaseAdapter):
         python_code: str,
         cte_frames: dict[str, pl.LazyFrame] | None = ...,
         allow_bool: Literal[True] = ...,
+        window: BatchWindow | None = ...,
     ) -> pl.LazyFrame | bool: ...
 
     def _run_python_model(
@@ -715,6 +806,7 @@ class PolarsAdapter(BaseAdapter):
         python_code: str,
         cte_frames: dict[str, pl.LazyFrame] | None = None,
         allow_bool: bool = False,
+        window: BatchWindow | None = None,
     ) -> pl.LazyFrame | bool:
         namespace: dict[str, Any] = {}
         exec(python_code, namespace)  # noqa: S102
@@ -730,7 +822,19 @@ class PolarsAdapter(BaseAdapter):
                 )
             catalog, schema, identifier = parts
             relation = self._resolve_relation(catalog, schema, identifier)
-            return self.get_storage_catalog(catalog).get_relation(relation)
+            frame = self.get_storage_catalog(catalog).get_relation(relation)
+            event_time = self.relation_event_time(catalog, schema, identifier)
+            if window is None or not event_time:
+                return frame
+            # dbt-core only filters the refs of SQL models on their event_time
+            return frame.filter(
+                in_time_range(
+                    event_time,
+                    frame.collect_schema()[event_time],
+                    window.start,
+                    window.end,
+                )
+            )
 
         dbt_obj = namespace["dbtObj"](load_df_function)
         result = namespace["model"](dbt_obj, pl)
@@ -921,6 +1025,17 @@ class PolarsAdapter(BaseAdapter):
         update_lower = {c.lower() for c in update}
         return [c for c in dest_cols if c.lower() not in update_lower]
 
+    def checked_result(
+        self, frame: pl.LazyFrame, model: dict, window: BatchWindow | None
+    ) -> tuple[pl.LazyFrame, RowGuard]:
+        """The model's result with its contract and microbatch window checked while
+        it is written; the write must run inside the guard's violations_reported."""
+        guard = RowGuard(model.get("name", ""))
+        frame = ModelContract(model).apply(frame, guard)
+        if window is not None:
+            frame = check_batch_window(frame, window, guard)
+        return frame, guard
+
     def _incremental_write(
         self,
         catalog: BaseCatalog,
@@ -934,6 +1049,7 @@ class PolarsAdapter(BaseAdapter):
         incremental_predicates: str | list[str] | None = None,
         partition_by: str | list[str] | None = None,
         model_config: dict | None = None,
+        window: BatchWindow | None = None,
     ) -> None:
         model_config = model_config or {}
         catalog.validate_incremental_relation(relation, model_config)
@@ -1013,6 +1129,18 @@ class PolarsAdapter(BaseAdapter):
                 allow_schema_evolution=allow_evolution,
                 model_config=model_config,
             )
+        elif strategy == "microbatch":
+            if window is None:
+                raise DbtRuntimeError("'microbatch' strategy requires a batch window")
+            catalog.replace_window_relation(
+                relation,
+                new_data,
+                window.event_time,
+                window.start,
+                window.end,
+                allow_schema_evolution=allow_evolution,
+                model_config=model_config,
+            )
         else:
             raise DbtRuntimeError(f"Unknown incremental strategy: {strategy!r}")
 
@@ -1034,15 +1162,18 @@ class PolarsAdapter(BaseAdapter):
         model: dict | None = None,
     ) -> None:
         model_config = model_config or {}
-        contract = ModelContract(model or {})
+        model = model or {}
+        window = batch_window(model)
         ctes = extra_ctes or []
         cte_frames = self._evaluate_ctes(ctes)
         sql = self._strip_all_ctes(sql, ctes)
-        new_data = contract.apply(
-            self._run_sql(sql, eager=False, extra_frames=cte_frames or None)
+        new_data, guard = self.checked_result(
+            self._run_sql(sql, eager=False, extra_frames=cte_frames or None),
+            model,
+            window,
         )
         catalog = self.get_storage_catalog(relation.catalog)
-        with contract.violations_reported():
+        with guard.violations_reported():
             self._incremental_write(
                 catalog,
                 relation,
@@ -1055,6 +1186,7 @@ class PolarsAdapter(BaseAdapter):
                 incremental_predicates,
                 partition_by,
                 model_config,
+                window,
             )
 
     @available
@@ -1069,15 +1201,17 @@ class PolarsAdapter(BaseAdapter):
         model: dict | None = None,
     ) -> None:
         model_config = model_config or {}
-        contract = ModelContract(model or {})
+        model = model or {}
         ctes = extra_ctes or []
         cte_frames = self._evaluate_ctes(ctes)
         sql = self._strip_all_ctes(sql, ctes)
-        result = contract.apply(
-            self._run_sql(sql, eager=False, extra_frames=cte_frames or None)
+        result, guard = self.checked_result(
+            self._run_sql(sql, eager=False, extra_frames=cte_frames or None),
+            model,
+            batch_window(model),
         )
         catalog = self.get_storage_catalog(relation.catalog)
-        with contract.violations_reported():
+        with guard.violations_reported():
             catalog.write_relation(
                 relation, result, _normalize_partition_by(partition_by), model_config
             )
@@ -1090,9 +1224,11 @@ class PolarsAdapter(BaseAdapter):
         cte_frames = self._evaluate_ctes(extra_ctes)
         python_code = self._strip_all_ctes(compiled_code, extra_ctes)
 
-        contract = ModelContract(parsed_model)
-        lazy_result = contract.apply(
-            self._run_python_model(python_code, cte_frames or None)
+        window = batch_window(parsed_model)
+        lazy_result, guard = self.checked_result(
+            self._run_python_model(python_code, cte_frames or None, window=window),
+            parsed_model,
+            window,
         )
 
         model_config = parsed_model.get("config", {})
@@ -1109,16 +1245,9 @@ class PolarsAdapter(BaseAdapter):
 
         partition_by = _normalize_partition_by(model_config.get("partition_by"))
 
-        # Mirrors dbt-core's should_full_refresh() macro
-        full_refresh = model_config.get("full_refresh")
-        if full_refresh is None:
-            full_refresh = getattr(get_flags(), "FULL_REFRESH", False)
-
-        if (
-            model_config.get("materialized") == "incremental"
-            and not full_refresh
-            and catalog.table_exists(target_relation)
-        ):
+        # Set by the incremental materialization, where should_full_refresh() also
+        # reflects the microbatch batch being run
+        if parsed_model.get("polars_incremental_write"):
             unique_key = model_config.get("unique_key")
             strategy = (
                 model_config.get("incremental_strategy")
@@ -1126,7 +1255,7 @@ class PolarsAdapter(BaseAdapter):
                 or "append"
             )
             on_schema_change = model_config.get("on_schema_change") or "ignore"
-            with contract.violations_reported():
+            with guard.violations_reported():
                 self._incremental_write(
                     catalog,
                     target_relation,
@@ -1140,9 +1269,10 @@ class PolarsAdapter(BaseAdapter):
                     or model_config.get("incremental_predicates"),
                     partition_by=partition_by,
                     model_config=model_config,
+                    window=window,
                 )
         else:
-            with contract.violations_reported():
+            with guard.violations_reported():
                 catalog.write_relation(
                     target_relation, lazy_result, partition_by, model_config
                 )

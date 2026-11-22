@@ -1,5 +1,6 @@
 import threading
 from abc import abstractmethod
+from datetime import datetime
 
 from dbt_common.exceptions import DbtRuntimeError
 
@@ -211,6 +212,26 @@ class TableFormatCatalog(BaseCatalog):
     ) -> None:
         self.catalog_for_existing(relation).delete_matched_relation(
             relation, df, keys, incremental_predicates, model_config
+        )
+
+    def replace_window_relation(
+        self,
+        relation: PolarsRelation,
+        data: pl.DataFrame | pl.LazyFrame,
+        event_time: str,
+        start: datetime,
+        end: datetime,
+        allow_schema_evolution: bool = False,
+        model_config: dict | None = None,
+    ) -> None:
+        self.catalog_for_existing(relation).replace_window_relation(
+            relation,
+            data,
+            event_time,
+            start,
+            end,
+            allow_schema_evolution,
+            model_config,
         )
 
     def apply_snapshot_delta(
