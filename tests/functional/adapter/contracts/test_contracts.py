@@ -117,7 +117,7 @@ models:
 """
 
 
-@pytest.mark.skip_profiles("iceberg")
+@pytest.mark.require_profiles("local")
 class TestFileFormatRejectsEnforcedConstraints(PolarsTestMixin):
     @pytest.fixture(scope="class")
     def models(self):
@@ -135,7 +135,7 @@ class TestFileFormatRejectsEnforcedConstraints(PolarsTestMixin):
         assert "only enforces on Delta and Iceberg" in results[0].message
 
 
-@pytest.mark.skip_profiles("iceberg")
+@pytest.mark.require_profiles("local")
 class TestFileFormatContractWithoutConstraints(PolarsTestMixin):
     @pytest.fixture(scope="class")
     def models(self):
