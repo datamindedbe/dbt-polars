@@ -8,8 +8,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Approval happens before the capacity queue, so an unapproved run doesn't
+  # hold the fabric-capacity slot and block other pull requests.
+  approve-fabric:
+    name: "Approve fabric"
+    environment:
+      name: fabric-approval
+      deployment: false
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: echo "Fabric tests approved"
+
   test-fabric:
     name: "Test fabric"
+    needs: approve-fabric
     # One run at a time on the capacity: a finishing run pauses it for everyone.
     concurrency:
       group: fabric-capacity

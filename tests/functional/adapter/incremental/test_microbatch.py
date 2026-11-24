@@ -133,7 +133,8 @@ from datetime import datetime
 
 def model(dbt, session):
     dbt.config(materialized="table", event_time="event_time")
-    # 00:30 in Brussels is 23:30 UTC on the previous day
+    # 00:30 in Brussels is 23:30 UTC on the previous day. Stored in UTC, the only
+    # time zone Iceberg supports.
     local = [
         datetime(2020, 1, 2, 0, 30),
         datetime(2020, 1, 2, 12, 0),
@@ -141,13 +142,14 @@ def model(dbt, session):
     ]
     return pl.DataFrame({
         "id": [1, 2, 3],
-        "event_time": pl.Series(local).dt.replace_time_zone("Europe/Brussels"),
+        "event_time": pl.Series(local)
+        .dt.replace_time_zone("Europe/Brussels")
+        .dt.convert_time_zone("UTC"),
     })
 """
 
 
 @skip_file_formats
-@pytest.mark.skip_profiles("iceberg")  # Iceberg only stores UTC timestamps
 class TestMicrobatchTimeZoneEventTime(PolarsTestMixin):
     @pytest.fixture(scope="class")
     def models(self):
@@ -217,7 +219,7 @@ class TestMicrobatchRejectsUniqueKey(PolarsTestMixin):
         assert "sets unique_key" in log_output
 
 
-@pytest.mark.skip_profiles("iceberg")
+@pytest.mark.require_profiles("local")
 class TestMicrobatchRejectsFileFormat(PolarsTestMixin):
     @pytest.fixture(scope="class")
     def models(self):
