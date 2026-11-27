@@ -12,7 +12,7 @@ from deltalake import CommitProperties, DeltaTable
 from deltalake.exceptions import CommitFailedError
 from deltalake.fs import DeltaStorageHandler
 from deltalake.transaction import AddAction
-from pyarrow.fs import FileSelector, PyFileSystem
+from pyarrow.fs import PyFileSystem
 
 import polars as pl
 from dbt.adapters.polars.catalogs.baseCatalog import get_write_options
@@ -311,6 +311,7 @@ class DeltaFormat:
 
         prefix = f"dbt-polars-{uuid.uuid4()}"
         fs = PyFileSystem(DeltaStorageHandler(dt.table_uri, options=storage_options))
+        sinked: list[Any] = []
         try:
             source.sink_parquet(
                 pl.PartitionBy(
@@ -319,24 +320,30 @@ class DeltaFormat:
                 ),
                 storage_options=storage_options,
                 mkdir=True,
+                sinked_paths_callback=lambda args: sinked.extend(args.paths),
             )
             stats_columns = _stats_columns(dt)
             now = int(time.time() * 1000)
-            actions = [
-                AddAction(
-                    path=info.path,
-                    size=info.size,
-                    partition_values={},
-                    modification_time=now,
-                    data_change=True,
-                    stats=_file_stats(
-                        pq.read_metadata(fs.open_input_file(info.path)),
-                        stats_columns,
-                    ),
+            actions = []
+            for file in sinked:
+                # The path relative to the table root, as the log records it.
+                relative = prefix + file.path.replace("\\", "/").split(prefix, 1)[1]
+                metadata = pq.read_metadata(fs.open_input_file(relative))
+                if metadata.num_rows != file.num_rows:
+                    raise DbtRuntimeError(
+                        f"merge into {path}: {relative} has {metadata.num_rows} rows, "
+                        f"the sink wrote {file.num_rows}"
+                    )
+                actions.append(
+                    AddAction(
+                        path=relative,
+                        size=fs.get_file_info(relative).size,
+                        partition_values={},
+                        modification_time=now,
+                        data_change=True,
+                        stats=_file_stats(metadata, stats_columns),
+                    )
                 )
-                for info in fs.get_file_info(FileSelector(prefix, recursive=True))
-                if info.is_file
-            ]
             dt.create_write_transaction(
                 actions,  # type: ignore[arg-type]
                 mode="append",

@@ -35,6 +35,15 @@ def added_stats(path):
     return [json.loads(a["add"]["stats"]) for a in actions if "add" in a]
 
 
+def parquet_files(path):
+    return {
+        os.path.join(root, name)
+        for root, _, names in os.walk(path)
+        for name in names
+        if name.endswith(".parquet")
+    }
+
+
 def test_all_new_rows_are_appended(table):
     merge(table, pl.LazyFrame({"id": [3, 4], "value": ["c", "d"]}))
 
@@ -45,8 +54,9 @@ def test_all_new_rows_are_appended(table):
     assert last_operation(table) == "WRITE"
     [stats] = added_stats(table)
     assert stats["numRecords"] == 2
-    assert stats["minValues"] == {"id": 3, "value": "c"}
-    assert stats["maxValues"] == {"id": 4, "value": "d"}
+    # String bounds the footer does not mark exact are left out.
+    assert stats["minValues"] == {"id": 3}
+    assert stats["maxValues"] == {"id": 4}
     assert stats["nullCount"] == {"id": 0, "value": 0}
 
 
@@ -105,7 +115,7 @@ def test_a_partitioned_table_is_merged(tmp_path):
 def test_append_refused_after_a_concurrent_commit(table):
     dt = DeltaTable(table)
     write_deltalake(table, pl.DataFrame({"id": [3], "value": ["c"]}), mode="append")
-    files = set(os.listdir(table))
+    files = parquet_files(table)
 
     with pytest.raises(DbtRuntimeError, match="changed since version"):
         DeltaFormat._append_if_all_new(
@@ -113,4 +123,4 @@ def test_append_refused_after_a_concurrent_commit(table):
         )
 
     assert pl.read_delta(table)["id"].sort().to_list() == [1, 2, 3]
-    assert set(os.listdir(table)) == files
+    assert parquet_files(table) == files
