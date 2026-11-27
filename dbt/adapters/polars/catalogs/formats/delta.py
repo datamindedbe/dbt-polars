@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 from pathlib import Path
 
-from deltalake import DeltaTable
+from dbt_common.exceptions import DbtRuntimeError
+from deltalake import CommitProperties, DeltaTable, write_deltalake
+from deltalake.exceptions import CommitFailedError
 
 import polars as pl
 from dbt.adapters.polars.catalogs.baseCatalog import get_write_options
@@ -126,6 +128,63 @@ class DeltaFormat:
         )
 
     @staticmethod
+    def _append_if_all_new(
+        dt: DeltaTable,
+        path: str,
+        df: pl.DataFrame,
+        keys: list[str],
+        allow_schema_evolution: bool,
+        storage_options: dict[str, str] | None,
+    ) -> bool:
+        """When no key of `df` is in the table, the merge only inserts: append `df`
+        instead of running delta-rs' merge, whose join holds the target in memory.
+        The table is probed at the version `dt` is loaded at and the append is pinned
+        to it (max_commit_retries=0): a commit since then fails it. True if appended."""
+        version = dt.version()
+        target = pl.scan_delta(path, version=version, storage_options=storage_options)
+        schema = target.collect_schema()
+        if df.is_empty() or any(k not in schema for k in keys):
+            return False
+        try:
+            source_keys = df.select(keys).unique().cast({k: schema[k] for k in keys})
+        except pl.exceptions.PolarsError:
+            return False
+        # A target row can only match inside the source's key range, which lets the
+        # scan skip files on their statistics.
+        bounds = [
+            pl.col(k).is_between(pl.lit(column.min()), pl.lit(column.max()))
+            for k in keys
+            if (column := source_keys.get_column(k)).null_count() < len(column)
+            and (
+                column.dtype.is_integer()
+                or column.dtype.is_temporal()
+                or column.dtype == pl.String
+            )
+        ]
+        candidates = target.select(keys)
+        if bounds:
+            candidates = candidates.filter(pl.all_horizontal(bounds))
+        matched = candidates.join(source_keys.lazy(), on=keys, how="semi").limit(1)
+        if matched.collect(engine="streaming").height:
+            return False
+        casts = {c: t for c, t in schema.items() if df.schema.get(c, t) != t}
+        rows = df.cast(casts).to_arrow(compat_level=pl.CompatLevel.oldest())  # type: ignore[arg-type]
+        try:
+            write_deltalake(
+                dt,
+                rows,
+                mode="append",
+                schema_mode="merge" if allow_schema_evolution else None,
+                commit_properties=CommitProperties(max_commit_retries=0),
+            )
+        except CommitFailedError as e:
+            raise DbtRuntimeError(
+                f"merge into {path}: the table changed since version {version} (a "
+                "concurrent write committed); merge refused, run it again"
+            ) from e
+        return True
+
+    @staticmethod
     def merge(
         path: str | Path,
         df: pl.DataFrame,
@@ -141,6 +200,10 @@ class DeltaFormat:
         if incremental_predicates:
             predicate += " AND " + " AND ".join(incremental_predicates)
         dt = DeltaTable(str(path), storage_options=storage_options)
+        if not incremental_predicates and DeltaFormat._append_if_all_new(
+            dt, str(path), df, keys, allow_schema_evolution, storage_options
+        ):
+            return
         (
             dt.merge(
                 df.to_arrow(),

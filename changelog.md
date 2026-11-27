@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixes
+
+- An incremental merge into a Delta table whose keys are all new appends the rows, pinned to the version it checked, instead of running delta-rs' merge, which held the whole table in memory (#68).
+
 ## v0.6.0
 
 ### Implements
