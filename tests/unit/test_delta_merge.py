@@ -61,14 +61,17 @@ def test_all_new_rows_are_appended(table):
 
 
 def test_stats_match_polars_delta_sink(tmp_path):
-    """The append's stats are the ones Polars' own Delta sink writes."""
+    """The append's stats are the ones Polars' own Delta sink writes, but for the
+    max of a sub-millisecond timestamp."""
     rows = pl.DataFrame(
         {
             "id": [5, 6, 7],
             "s": ["x", None, "zz"],
             "f": [1.5, float("inf"), -2.0],
             "d": [date(2026, 1, 1), date(2026, 3, 1), None],
-            "ts": [datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc)] * 3,
+            # Whole milliseconds: a sub-millisecond max is rounded up here, where
+            # Polars' sink truncates it (test_timestamp_stats_keep_every_row_readable).
+            "ts": [datetime(2026, 1, 2, 3, 4, 5, 678000, tzinfo=timezone.utc)] * 3,
             "ntz": [datetime(2026, 1, 2, 3, 4, 5)] * 3,
             "dec": [Decimal("1.50"), Decimal("-0.05"), None],
             "b": [True, False, True],
@@ -122,8 +125,8 @@ def test_timestamp_stats_keep_every_row_readable(tmp_path):
 
     [stats] = added_stats(path)
     assert stats["minValues"]["at"] == "2026-01-02T03:04:05.678Z"
-    # Truncated to milliseconds, as delta-rs writes it; readers widen the max.
-    assert stats["maxValues"]["at"] == "2026-01-02T03:04:05.678Z"
+    # A max rounded up: Polars' reader does not widen a truncated one.
+    assert stats["maxValues"]["at"] == "2026-01-02T03:04:05.679Z"
     found = pl.scan_delta(path).filter(pl.col("at") == late).collect()
     assert found["v"].to_list() == [2]
 

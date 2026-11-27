@@ -154,9 +154,14 @@ class _Decimal(str):
     """A decimal written as a bare JSON number, all digits of its scale."""
 
 
-def _timestamp(micros: int, utc: bool) -> str | None:
-    """A timestamp as delta-rs writes it: truncated to milliseconds (readers widen
-    the max by 1 ms), the fraction left out when it is zero."""
+def _timestamp(micros: int, utc: bool, is_max: bool) -> str | None:
+    """A timestamp in the millisecond text Delta stats hold, the fraction left out
+    when it is zero. A min is truncated; a max is rounded up, so the bound holds for
+    every reader: delta-rs truncates both and counts on readers to widen the max by
+    1 ms, which Polars' scan_delta does not (a row at .678901 under a max of .678 is
+    skipped)."""
+    if is_max:
+        micros = -(-micros // 1000) * 1000
     value = datetime(1970, 1, 1) + timedelta(microseconds=micros)
     if not 1 <= value.year <= 9999:
         return None
@@ -201,10 +206,15 @@ def _bound(statistics: Any, is_min: bool) -> tuple[Any, Any] | None:
         day = date(1970, 1, 1) + timedelta(days=int(raw))
         return (int(raw), day.isoformat()) if 1 <= day.year <= 9999 else None
     if physical == "INT64" and kind == "Timestamp":
-        unit = logical.get("timeUnit")
-        micros = {"milliseconds": raw * 1000, "nanoseconds": raw // 1000}.get(unit, raw)
-        text = _timestamp(int(micros), bool(logical.get("isAdjustedToUTC")))
-        return (int(micros), text) if text is not None else None
+        unit, raw = logical.get("timeUnit"), int(raw)
+        if unit == "milliseconds":
+            micros = raw * 1000
+        elif unit == "nanoseconds":
+            micros = raw // 1000 if is_min else -(-raw // 1000)
+        else:
+            micros = raw
+        text = _timestamp(micros, bool(logical.get("isAdjustedToUTC")), not is_min)
+        return (micros, text) if text is not None else None
     if physical == "BYTE_ARRAY" and kind in ("String", "Enum", "JSON"):
         text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
         return text, text
