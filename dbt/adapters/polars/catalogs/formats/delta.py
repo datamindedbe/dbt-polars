@@ -1,13 +1,140 @@
-from datetime import datetime, timezone
+import contextlib
+import json
+import time
+import uuid
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
+import pyarrow.parquet as pq
 from dbt_common.exceptions import DbtRuntimeError
-from deltalake import CommitProperties, DeltaTable, write_deltalake
+from deltalake import CommitProperties, DeltaTable
 from deltalake.exceptions import CommitFailedError
+from deltalake.fs import DeltaStorageHandler
+from deltalake.transaction import AddAction
+from pyarrow.fs import FileSelector, PyFileSystem
 
 import polars as pl
 from dbt.adapters.polars.catalogs.baseCatalog import get_write_options
 from dbt.adapters.polars.utils import first_day_from
+
+# The size of a file an append writes, as Polars estimates the rows in memory.
+APPEND_FILE_BYTES = 512 * 1024 * 1024
+# The writer features an append of new files honors: the others need the writer to
+# do more than add files (row tracking, column mapping, identity columns, ...).
+APPEND_WRITER_FEATURES = {
+    "appendOnly",
+    "changeDataFeed",
+    "checkConstraints",
+    "checkpointProtection",
+    "deletionVectors",
+    "domainMetadata",
+    "generatedColumns",
+    "invariants",
+    "timestampNtz",
+    "v2Checkpoint",
+    "vacuumProtocolCheck",
+}
+FIELD_RULES = ("delta.generationExpression", "delta.identity", "delta.invariants")
+
+
+def _append_blocker(dt: DeltaTable) -> str | None:
+    """Why new files cannot be committed to `dt` as they are written, or None."""
+    metadata = dt.metadata()
+    configuration = metadata.configuration
+    protocol = dt.protocol()
+    if metadata.partition_columns:
+        return "a partitioned table"
+    if (configuration.get("delta.columnMapping.mode") or "none") != "none":
+        return "column mapping"
+    if any(key.startswith("delta.constraints.") for key in configuration):
+        return "CHECK constraints"
+    if any(
+        key.startswith(FIELD_RULES)
+        for field in dt.schema().fields
+        for key in field.metadata
+    ):
+        return "generated, identity or invariant columns"
+    if protocol.min_writer_version > 7 or (
+        set(protocol.writer_features or []) - APPEND_WRITER_FEATURES
+    ):
+        return "writer features"
+    return None
+
+
+def _stats_columns(dt: DeltaTable) -> set[str]:
+    """The columns a file's statistics cover, as the table configures them."""
+    configuration = dt.metadata().configuration
+    names = [field.name for field in dt.schema().fields]
+    if listed := configuration.get("delta.dataSkippingStatsColumns"):
+        return {name.strip().strip("`") for name in listed.split(",")}
+    count = int(configuration.get("delta.dataSkippingNumIndexedCols") or 32)
+    return set(names if count < 0 else names[:count])
+
+
+def _stat_value(value: Any, is_max: bool) -> Any:
+    """A Parquet min/max as Delta writes it in a file's stats, or None to leave the
+    column out. Timestamps have millisecond precision, a max rounded up."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, str)):
+        return value
+    if isinstance(value, datetime):
+        aware = value.tzinfo is not None
+        if aware:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        if is_max and value.microsecond % 1000:
+            value += timedelta(microseconds=1000 - value.microsecond % 1000)
+        millis = f"{value.microsecond // 1000:03d}"
+        text = value.strftime("%Y-%m-%dT%H:%M:%S.") + millis
+        return text + "Z" if aware else text
+    if isinstance(value, date):
+        return value.isoformat()
+    return None
+
+
+def _exact(statistics: Any) -> bool:
+    return bool(
+        getattr(statistics, "is_min_value_exact", False)
+        and getattr(statistics, "is_max_value_exact", False)
+    )
+
+
+def _file_stats(metadata: pq.FileMetaData, columns: set[str]) -> str:
+    """A data file's Delta stats from its Parquet footer: the row count, and the null
+    count, min and max of top-level integer, string, date and timestamp columns.
+    A bound that may be truncated is left out: a missing stat only loses pruning, a
+    wrong one hides rows."""
+    stats: dict[str, Any] = {
+        "numRecords": metadata.num_rows,
+        "minValues": {},
+        "maxValues": {},
+        "nullCount": {},
+    }
+    for j in range(metadata.num_columns if metadata.num_row_groups else 0):
+        name = metadata.row_group(0).column(j).path_in_schema
+        if name not in columns:
+            continue
+        chunks = [
+            metadata.row_group(i).column(j) for i in range(metadata.num_row_groups)
+        ]
+        if any(c.statistics is None or not c.statistics.has_null_count for c in chunks):
+            continue
+        stats["nullCount"][name] = sum(c.statistics.null_count for c in chunks)
+        bounded = [c.statistics for c in chunks if c.statistics.has_min_max]
+        if not bounded or any(
+            not c.statistics.has_min_max and c.statistics.null_count != c.num_values
+            for c in chunks
+        ):
+            continue
+        if isinstance(bounded[0].min, str) and not all(map(_exact, bounded)):
+            continue
+        low = _stat_value(min(s.min for s in bounded), is_max=False)
+        high = _stat_value(max(s.max for s in bounded), is_max=True)
+        if low is not None and high is not None:
+            stats["minValues"][name] = low
+            stats["maxValues"][name] = high
+    return json.dumps(stats)
 
 
 class DeltaFormat:
@@ -131,63 +258,106 @@ class DeltaFormat:
     def _append_if_all_new(
         dt: DeltaTable,
         path: str,
-        df: pl.DataFrame,
+        data: pl.DataFrame | pl.LazyFrame,
         keys: list[str],
-        allow_schema_evolution: bool,
         storage_options: dict[str, str] | None,
     ) -> bool:
-        """When no key of `df` is in the table, the merge only inserts: append `df`
-        instead of running delta-rs' merge, whose join holds the target in memory.
-        The table is probed at the version `dt` is loaded at and the append is pinned
-        to it (max_commit_retries=0): a commit since then fails it. True if appended."""
+        """When no key of `data` is in the table, the merge only inserts: Polars writes
+        the rows as new files, streaming, and delta-rs only commits them, instead of
+        running delta-rs' merge, whose join holds the target in memory. The table is
+        probed at the version `dt` is loaded at and the commit is pinned to it
+        (max_commit_retries=0): a commit since then fails it. True if appended."""
+        if _append_blocker(dt) is not None:
+            return False
         version = dt.version()
         target = pl.scan_delta(path, version=version, storage_options=storage_options)
         schema = target.collect_schema()
-        if df.is_empty() or any(k not in schema for k in keys):
+        source = data.lazy()
+        if set(source.collect_schema().names()) != set(schema.names()):
             return False
-        try:
-            source_keys = df.select(keys).unique().cast({k: schema[k] for k in keys})
-        except pl.exceptions.PolarsError:
-            return False
+        source = source.select(schema.names()).cast(dict(schema))  # type: ignore[arg-type]
+
         # A target row can only match inside the source's key range, which lets the
-        # scan skip files on their statistics.
-        bounds = [
-            pl.col(k).is_between(pl.lit(column.min()), pl.lit(column.max()))
+        # scan skip files on their statistics. The range is one streaming pass.
+        ranged = [
+            k
             for k in keys
-            if (column := source_keys.get_column(k)).null_count() < len(column)
-            and (
-                column.dtype.is_integer()
-                or column.dtype.is_temporal()
-                or column.dtype == pl.String
+            if schema[k].is_integer()
+            or schema[k].is_temporal()
+            or schema[k] == pl.String
+        ]
+        extremes = source.select(
+            pl.len().alias("rows"),
+            *(pl.col(k).min().alias(f"min_{i}") for i, k in enumerate(ranged)),
+            *(pl.col(k).max().alias(f"max_{i}") for i, k in enumerate(ranged)),
+        ).collect(engine="streaming")
+        if extremes.item(0, "rows") == 0:
+            return True
+        bounds = [
+            pl.col(k).is_between(
+                pl.lit(extremes.item(0, f"min_{i}"), dtype=schema[k]),
+                pl.lit(extremes.item(0, f"max_{i}"), dtype=schema[k]),
             )
+            for i, k in enumerate(ranged)
+            if extremes.item(0, f"min_{i}") is not None
         ]
         candidates = target.select(keys)
         if bounds:
             candidates = candidates.filter(pl.all_horizontal(bounds))
-        matched = candidates.join(source_keys.lazy(), on=keys, how="semi").limit(1)
-        if matched.collect(engine="streaming").height:
-            return False
-        casts = {c: t for c, t in schema.items() if df.schema.get(c, t) != t}
-        rows = df.cast(casts).to_arrow(compat_level=pl.CompatLevel.oldest())  # type: ignore[arg-type]
+        if candidates.limit(1).collect(engine="streaming").height:
+            matched = source.select(keys).join(candidates, on=keys, how="semi")
+            if matched.limit(1).collect(engine="streaming").height:
+                return False
+
+        prefix = f"dbt-polars-{uuid.uuid4()}"
+        fs = PyFileSystem(DeltaStorageHandler(dt.table_uri, options=storage_options))
         try:
-            write_deltalake(
-                dt,
-                rows,
+            source.sink_parquet(
+                pl.PartitionBy(
+                    f"{path.rstrip('/')}/{prefix}",
+                    approximate_bytes_per_file=APPEND_FILE_BYTES,
+                ),
+                storage_options=storage_options,
+                mkdir=True,
+            )
+            stats_columns = _stats_columns(dt)
+            now = int(time.time() * 1000)
+            actions = [
+                AddAction(
+                    path=info.path,
+                    size=info.size,
+                    partition_values={},
+                    modification_time=now,
+                    data_change=True,
+                    stats=_file_stats(
+                        pq.read_metadata(fs.open_input_file(info.path)),
+                        stats_columns,
+                    ),
+                )
+                for info in fs.get_file_info(FileSelector(prefix, recursive=True))
+                if info.is_file
+            ]
+            dt.create_write_transaction(
+                actions,  # type: ignore[arg-type]
                 mode="append",
-                schema_mode="merge" if allow_schema_evolution else None,
+                schema=dt.schema(),
                 commit_properties=CommitProperties(max_commit_retries=0),
             )
-        except CommitFailedError as e:
-            raise DbtRuntimeError(
-                f"merge into {path}: the table changed since version {version} (a "
-                "concurrent write committed); merge refused, run it again"
-            ) from e
+        except BaseException as e:
+            with contextlib.suppress(Exception):
+                fs.delete_dir(prefix)
+            if isinstance(e, CommitFailedError):
+                raise DbtRuntimeError(
+                    f"merge into {path}: the table changed since version {version} "
+                    "(a concurrent write committed); merge refused, run it again"
+                ) from e
+            raise
         return True
 
     @staticmethod
     def merge(
         path: str | Path,
-        df: pl.DataFrame,
+        df: pl.DataFrame | pl.LazyFrame,
         keys: list[str],
         except_cols: list[str] | None,
         incremental_predicates: list[str] | None,
@@ -201,9 +371,11 @@ class DeltaFormat:
             predicate += " AND " + " AND ".join(incremental_predicates)
         dt = DeltaTable(str(path), storage_options=storage_options)
         if not incremental_predicates and DeltaFormat._append_if_all_new(
-            dt, str(path), df, keys, allow_schema_evolution, storage_options
+            dt, str(path), df, keys, storage_options
         ):
             return
+        if isinstance(df, pl.LazyFrame):
+            df = df.collect()
         (
             dt.merge(
                 df.to_arrow(),
