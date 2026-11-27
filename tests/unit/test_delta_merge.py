@@ -1,6 +1,7 @@
 import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 
 import polars as pl
 import pytest
@@ -54,10 +55,36 @@ def test_all_new_rows_are_appended(table):
     assert last_operation(table) == "WRITE"
     [stats] = added_stats(table)
     assert stats["numRecords"] == 2
-    # String bounds the footer does not mark exact are left out.
-    assert stats["minValues"] == {"id": 3}
-    assert stats["maxValues"] == {"id": 4}
+    assert stats["minValues"] == {"id": 3, "value": "c"}
+    assert stats["maxValues"] == {"id": 4, "value": "d"}
     assert stats["nullCount"] == {"id": 0, "value": 0}
+
+
+def test_stats_match_polars_delta_sink(tmp_path):
+    """The append's stats are the ones Polars' own Delta sink writes."""
+    rows = pl.DataFrame(
+        {
+            "id": [5, 6, 7],
+            "s": ["x", None, "zz"],
+            "f": [1.5, float("inf"), -2.0],
+            "d": [date(2026, 1, 1), date(2026, 3, 1), None],
+            "ts": [datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc)] * 3,
+            "ntz": [datetime(2026, 1, 2, 3, 4, 5)] * 3,
+            "dec": [Decimal("1.50"), Decimal("-0.05"), None],
+            "b": [True, False, True],
+            "st": [{"a": 1, "c": "p"}, {"a": 2, "c": "q"}, None],
+        },
+        schema_overrides={"dec": pl.Decimal(10, 2), "ts": pl.Datetime("us", "UTC")},
+    )
+    seed = rows.head(1).with_columns(pl.col("id") - 100)
+    ours, polars_sink = str(tmp_path / "ours"), str(tmp_path / "polars")
+    for path in (ours, polars_sink):
+        seed.write_delta(path)
+    rows.lazy().sink_delta(polars_sink, mode="append")
+
+    merge(ours, rows.lazy())
+
+    assert added_stats(ours) == added_stats(polars_sink)
 
 
 def test_a_matching_key_is_merged(table):
@@ -95,7 +122,8 @@ def test_timestamp_stats_keep_every_row_readable(tmp_path):
 
     [stats] = added_stats(path)
     assert stats["minValues"]["at"] == "2026-01-02T03:04:05.678Z"
-    assert stats["maxValues"]["at"] == "2026-01-02T03:04:05.679Z"
+    # Truncated to milliseconds, as delta-rs writes it; readers widen the max.
+    assert stats["maxValues"]["at"] == "2026-01-02T03:04:05.678Z"
     found = pl.scan_delta(path).filter(pl.col("at") == late).collect()
     assert found["v"].to_list() == [2]
 

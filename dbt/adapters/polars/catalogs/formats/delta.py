@@ -1,7 +1,10 @@
 import contextlib
 import json
+import math
+import re
 import time
 import uuid
+from collections.abc import Iterator
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -11,6 +14,7 @@ from dbt_common.exceptions import DbtRuntimeError
 from deltalake import CommitProperties, DeltaTable
 from deltalake.exceptions import CommitFailedError
 from deltalake.fs import DeltaStorageHandler
+from deltalake.schema import ArrayType, MapType, StructType
 from deltalake.transaction import AddAction
 from pyarrow.fs import PyFileSystem
 
@@ -20,91 +24,202 @@ from dbt.adapters.polars.utils import first_day_from
 
 # The size of a file an append writes, as Polars estimates the rows in memory.
 APPEND_FILE_BYTES = 512 * 1024 * 1024
-# The writer features an append of new files honors: the others need the writer to
-# do more than add files (row tracking, column mapping, identity columns, ...).
-APPEND_WRITER_FEATURES = {
-    "appendOnly",
-    "changeDataFeed",
-    "checkConstraints",
-    "checkpointProtection",
-    "deletionVectors",
-    "domainMetadata",
-    "generatedColumns",
-    "invariants",
-    "timestampNtz",
-    "v2Checkpoint",
-    "vacuumProtocolCheck",
-}
-FIELD_RULES = ("delta.generationExpression", "delta.identity", "delta.invariants")
+
+# What an append of new files may commit to, as Polars' own Delta sink allows it
+# (polars/io/delta/_sink.py): the writer features it honors, and the variant
+# features when the table has no variant column.
+ALLOWED_WRITER_FEATURES = frozenset(
+    {"appendOnly", "invariants", "timestampNtz", "changeDataFeed", "deletionVectors"}
+)
+VARIANT_WRITER_FEATURES = frozenset({"variantType", "variantType-preview"})
+DEFAULT_NUM_INDEXED_COLS = 32
+
+# A name in backticks, an unquoted name, or a separator.
+_STATS_COLUMN_TOKEN = re.compile(r"`((?:[^`]|``)*)`|([^`.,]+)|([.,])")
+
+
+def _fields(fields: list[Any], prefix: tuple[str, ...] = ()) -> Iterator[Any]:
+    """Every field of a Delta schema, nested ones included, with its path."""
+    for field in fields:
+        path = (*prefix, field.name)
+        yield path, field
+        if isinstance(field.type, StructType):
+            yield from _fields(field.type.fields, path)
 
 
 def _append_blocker(dt: DeltaTable) -> str | None:
-    """Why new files cannot be committed to `dt` as they are written, or None."""
+    """Why new files cannot be committed to `dt` as they are written, or None: the
+    checks of Polars' Delta sink. Such a table keeps delta-rs' merge."""
+    protocol = dt.protocol()
+    if protocol.min_writer_version > 7:
+        return f"writer version {protocol.min_writer_version}"
+    fields = list(_fields(dt.schema().fields))
+    if protocol.min_writer_version == 7:
+        unsupported = set(protocol.writer_features or ()) - ALLOWED_WRITER_FEATURES
+        if not any(getattr(f.type, "type", None) == "variant" for _, f in fields):
+            unsupported -= VARIANT_WRITER_FEATURES
+        if unsupported:
+            return f"writer features {sorted(unsupported)}"
     metadata = dt.metadata()
     configuration = metadata.configuration
-    protocol = dt.protocol()
     if metadata.partition_columns:
         return "a partitioned table"
-    if (configuration.get("delta.columnMapping.mode") or "none") != "none":
-        return "column mapping"
     if any(key.startswith("delta.constraints.") for key in configuration):
         return "CHECK constraints"
-    if any(
-        key.startswith(FIELD_RULES)
-        for field in dt.schema().fields
-        for key in field.metadata
-    ):
-        return "generated, identity or invariant columns"
-    if protocol.min_writer_version > 7 or (
-        set(protocol.writer_features or []) - APPEND_WRITER_FEATURES
-    ):
-        return "writer features"
+    if (configuration.get("delta.columnMapping.mode") or "none") != "none":
+        return "column mapping"
+    if (configuration.get("delta.enableRowTracking") or "false").lower() == "true":
+        return "row tracking"
+    for _, field in fields:
+        for key in field.metadata:
+            if key in ("delta.generationExpression", "delta.invariants") or (
+                key.startswith("delta.identity.")
+            ):
+                return f"column {field.name!r} has {key}"
     return None
 
 
-def _stats_columns(dt: DeltaTable) -> set[str]:
-    """The columns a file's statistics cover, as the table configures them."""
+def _stats_column_paths(stats_columns: str) -> list[tuple[str, ...]]:
+    """The column paths `delta.dataSkippingStatsColumns` lists: commas separate
+    columns, dots the fields of a nested one, backticks quote a name."""
+    paths: list[tuple[str, ...]] = []
+    path: list[str] = []
+    name = ""
+    for m in _STATS_COLUMN_TOKEN.finditer(stats_columns + ","):
+        quoted, unquoted, separator = m.groups()
+        if quoted is not None:
+            name += quoted.replace("``", "`")
+        elif unquoted is not None:
+            name += unquoted.strip()
+        else:
+            path.append(name)
+            name = ""
+            if separator == ",":
+                if any(path):
+                    paths.append(tuple(path))
+                path = []
+    return paths
+
+
+def _stats_leaves(dt: DeltaTable) -> set[tuple[str, ...]]:
+    """The leaf columns a file's stats cover, as delta-rs and Polars choose them:
+    `delta.dataSkippingStatsColumns`, else the first
+    `delta.dataSkippingNumIndexedCols` top-level columns (all when negative).
+    Leaves in a list or map, and binary leaves, get none."""
+    leaves: list[tuple[str, ...]] = []
+
+    def visit(dtype: Any, path: tuple[str, ...]) -> None:
+        if isinstance(dtype, StructType):
+            for child in dtype.fields:
+                visit(child.type, (*path, child.name))
+        elif not isinstance(dtype, (ArrayType, MapType)) and dtype.type != "binary":
+            leaves.append(path)
+
     configuration = dt.metadata().configuration
-    names = [field.name for field in dt.schema().fields]
+    fields = list(dt.schema().fields)
     if listed := configuration.get("delta.dataSkippingStatsColumns"):
-        return {name.strip().strip("`") for name in listed.split(",")}
-    count = int(configuration.get("delta.dataSkippingNumIndexedCols") or 32)
-    return set(names if count < 0 else names[:count])
+        selected = _stats_column_paths(listed)
+        for field in fields:
+            visit(field.type, (field.name,))
+        return {leaf for leaf in leaves if any(leaf[: len(p)] == p for p in selected)}
+    count = int(
+        configuration.get("delta.dataSkippingNumIndexedCols")
+        or DEFAULT_NUM_INDEXED_COLS
+    )
+    for field in fields if count < 0 else fields[:count]:
+        visit(field.type, (field.name,))
+    return set(leaves)
 
 
-def _stat_value(value: Any, is_max: bool) -> Any:
-    """A Parquet min/max as Delta writes it in a file's stats, or None to leave the
-    column out. Timestamps have millisecond precision, a max rounded up."""
-    if isinstance(value, bool):
+def _non_nullable_leaves(dt: DeltaTable) -> list[tuple[str, ...]]:
+    """The leaves whose null count must be 0: non-nullable, as every struct above
+    them, and not in a list or map."""
+    out: list[tuple[str, ...]] = []
+
+    def visit(field: Any, path: tuple[str, ...]) -> None:
+        if field.nullable:
+            return
+        if isinstance(field.type, StructType):
+            for child in field.type.fields:
+                visit(child, (*path, child.name))
+        elif not isinstance(field.type, (ArrayType, MapType)):
+            out.append(path)
+
+    for field in dt.schema().fields:
+        visit(field, (field.name,))
+    return out
+
+
+class _Decimal(str):
+    """A decimal written as a bare JSON number, all digits of its scale."""
+
+
+def _timestamp(micros: int, utc: bool) -> str | None:
+    """A timestamp as delta-rs writes it: truncated to milliseconds (readers widen
+    the max by 1 ms), the fraction left out when it is zero."""
+    value = datetime(1970, 1, 1) + timedelta(microseconds=micros)
+    if not 1 <= value.year <= 9999:
         return None
-    if isinstance(value, (int, str)):
-        return value
-    if isinstance(value, datetime):
-        aware = value.tzinfo is not None
-        if aware:
-            value = value.astimezone(timezone.utc).replace(tzinfo=None)
-        if is_max and value.microsecond % 1000:
-            value += timedelta(microseconds=1000 - value.microsecond % 1000)
-        millis = f"{value.microsecond // 1000:03d}"
-        text = value.strftime("%Y-%m-%dT%H:%M:%S.") + millis
-        return text + "Z" if aware else text
-    if isinstance(value, date):
-        return value.isoformat()
+    fraction = f".{value.microsecond // 1000:03d}" if value.microsecond else ""
+    if utc:
+        return value.strftime("%Y-%m-%dT%H:%M:%S") + fraction + "Z"
+    return value.strftime("%Y-%m-%d %H:%M:%S") + fraction
+
+
+def _decimal(unscaled: int, scale: int) -> tuple[Any, Any]:
+    sign, digits = ("-" if unscaled < 0 else ""), str(abs(unscaled))
+    if scale:
+        digits = digits.rjust(scale + 1, "0")
+        digits = f"{digits[:-scale]}.{digits[-scale:]}"
+    return unscaled, _Decimal(sign + digits)
+
+
+def _bound(statistics: Any, is_min: bool) -> tuple[Any, Any] | None:
+    """A row group's min or max as (sort key, Delta value), or None when Delta has
+    no value for it (NaN, binary data, a year outside 1 to 9999)."""
+    raw = statistics.min_raw if is_min else statistics.max_raw
+    logical = json.loads(statistics.logical_type.to_json() or "{}")
+    kind = logical.get("Type")
+    physical = statistics.physical_type
+    if physical == "BOOLEAN":
+        return raw, bool(raw)
+    if physical in ("FLOAT", "DOUBLE"):
+        if math.isnan(raw):
+            return None
+        return raw, raw if math.isfinite(raw) else None
+    if kind == "Decimal" and physical in ("INT32", "INT64"):
+        return _decimal(int(raw), int(logical["scale"]))
+    if kind == "Decimal" and physical in ("BYTE_ARRAY", "FIXED_LEN_BYTE_ARRAY"):
+        return _decimal(int.from_bytes(raw, "big", signed=True), int(logical["scale"]))
+    if physical in ("INT32", "INT64") and kind in (None, "None", "Int"):
+        value = int(raw)
+        bits = 32 if physical == "INT32" else 64
+        if kind == "Int" and not logical.get("isSigned", True) and value < 0:
+            value += 1 << bits
+        return value, value
+    if physical == "INT32" and kind == "Date":
+        day = date(1970, 1, 1) + timedelta(days=int(raw))
+        return (int(raw), day.isoformat()) if 1 <= day.year <= 9999 else None
+    if physical == "INT64" and kind == "Timestamp":
+        unit = logical.get("timeUnit")
+        micros = {"milliseconds": raw * 1000, "nanoseconds": raw // 1000}.get(unit, raw)
+        text = _timestamp(int(micros), bool(logical.get("isAdjustedToUTC")))
+        return (int(micros), text) if text is not None else None
+    if physical == "BYTE_ARRAY" and kind in ("String", "Enum", "JSON"):
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        return text, text
     return None
 
 
-def _exact(statistics: Any) -> bool:
-    return bool(
-        getattr(statistics, "is_min_value_exact", False)
-        and getattr(statistics, "is_max_value_exact", False)
-    )
-
-
-def _file_stats(metadata: pq.FileMetaData, columns: set[str]) -> str:
-    """A data file's Delta stats from its Parquet footer: the row count, and the null
-    count, min and max of top-level integer, string, date and timestamp columns.
-    A bound that may be truncated is left out: a missing stat only loses pruning, a
-    wrong one hides rows."""
+def _file_stats(
+    metadata: pq.FileMetaData,
+    leaves: set[tuple[str, ...]],
+    non_nullable: list[tuple[str, ...]],
+    file: str,
+) -> str:
+    """A data file's Delta stats from its Parquet footer, by the rules of Polars'
+    Delta sink (polars-python/src/io/delta_stats.rs): the row count, and the null
+    count, min and max of each leaf in `leaves`, nested in its structs."""
     stats: dict[str, Any] = {
         "numRecords": metadata.num_rows,
         "minValues": {},
@@ -112,29 +227,57 @@ def _file_stats(metadata: pq.FileMetaData, columns: set[str]) -> str:
         "nullCount": {},
     }
     for j in range(metadata.num_columns if metadata.num_row_groups else 0):
-        name = metadata.row_group(0).column(j).path_in_schema
-        if name not in columns:
+        path = tuple(metadata.schema.column(j).path.split("."))
+        null_count: int | None = 0
+        low: tuple[Any, Any] | None = None
+        high: tuple[Any, Any] | None = None
+        usable = True
+        for i in range(metadata.num_row_groups):
+            chunk = metadata.row_group(i).column(j)
+            st = chunk.statistics
+            if st is None or not st.has_null_count:
+                null_count = None
+            elif null_count is not None:
+                null_count += st.null_count
+            if st is not None and st.has_min_max:
+                lo, hi = _bound(st, True), _bound(st, False)
+                if lo is None or hi is None:
+                    usable = False
+                    continue
+                low = lo if low is None or lo[0] < low[0] else low
+                high = hi if high is None or hi[0] > high[0] else high
+            elif st is None or chunk.num_values - (st.null_count or 0) > 0:
+                # A row group of only nulls leaves the bounds as they are.
+                usable = False
+        if path in non_nullable and metadata.num_rows and null_count != 0:
+            raise DbtRuntimeError(
+                f"non-nullable column '{'.'.join(path)}' has nulls in {file}"
+            )
+        if path not in leaves:
             continue
-        chunks = [
-            metadata.row_group(i).column(j) for i in range(metadata.num_row_groups)
-        ]
-        if any(c.statistics is None or not c.statistics.has_null_count for c in chunks):
-            continue
-        stats["nullCount"][name] = sum(c.statistics.null_count for c in chunks)
-        bounded = [c.statistics for c in chunks if c.statistics.has_min_max]
-        if not bounded or any(
-            not c.statistics.has_min_max and c.statistics.null_count != c.num_values
-            for c in chunks
+        for key, value in (
+            ("minValues", low[1] if usable and low else None),
+            ("maxValues", high[1] if usable and high else None),
+            ("nullCount", null_count),
         ):
-            continue
-        if isinstance(bounded[0].min, str) and not all(map(_exact, bounded)):
-            continue
-        low = _stat_value(min(s.min for s in bounded), is_max=False)
-        high = _stat_value(max(s.max for s in bounded), is_max=True)
-        if low is not None and high is not None:
-            stats["minValues"][name] = low
-            stats["maxValues"][name] = high
-    return json.dumps(stats)
+            if value is None and not (key != "nullCount" and usable and low):
+                continue
+            node = stats[key]
+            for name in path[:-1]:
+                node = node.setdefault(name, {})
+            node[path[-1]] = value
+    return _json(stats)
+
+
+def _json(node: Any) -> str:
+    """JSON of the stats, with decimals as bare numbers."""
+    if isinstance(node, dict):
+        return (
+            "{" + ",".join(f"{json.dumps(k)}:{_json(v)}" for k, v in node.items()) + "}"
+        )
+    if isinstance(node, _Decimal):
+        return str.__str__(node)
+    return json.dumps(node)
 
 
 class DeltaFormat:
@@ -322,7 +465,8 @@ class DeltaFormat:
                 mkdir=True,
                 sinked_paths_callback=lambda args: sinked.extend(args.paths),
             )
-            stats_columns = _stats_columns(dt)
+            leaves = _stats_leaves(dt)
+            non_nullable = _non_nullable_leaves(dt)
             now = int(time.time() * 1000)
             actions = []
             for file in sinked:
@@ -341,7 +485,7 @@ class DeltaFormat:
                         partition_values={},
                         modification_time=now,
                         data_change=True,
-                        stats=_file_stats(metadata, stats_columns),
+                        stats=_file_stats(metadata, leaves, non_nullable, relative),
                     )
                 )
             dt.create_write_transaction(
