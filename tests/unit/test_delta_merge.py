@@ -72,9 +72,9 @@ def test_timestamp_stats_keep_every_row_readable(tmp_path):
     path = str(tmp_path / "ts")
     ts = pl.Datetime("us", "UTC")
     first = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    pl.DataFrame({"at": [first], "v": [1]}, schema={"at": ts, "v": pl.Int64}).write_delta(
-        path
-    )
+    pl.DataFrame(
+        {"at": [first], "v": [1]}, schema={"at": ts, "v": pl.Int64}
+    ).write_delta(path)
     late = datetime(2026, 1, 2, 3, 4, 5, 678901, tzinfo=timezone.utc)
 
     merge(
